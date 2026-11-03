@@ -263,8 +263,11 @@ object NativeAdbService {
     /**
      * Execute a shell command on the connected device and return stdout text.
      */
+    private fun rootWrap(command: String): String =
+        if (command.isBlank()) command else "su -c ${quoteShellArg(command)}"
     suspend fun shell(command: String): String {
         val conn = snapshotConnection()
+        val wrapped = rootWrap(command)
         val response = conn.shell(command)
         Log.d(TAG, "command: $command, response: $response")
         return response
@@ -337,8 +340,15 @@ object NativeAdbService {
     }
 
     suspend fun openShellStream(command: String): AdbSocketStream {
-        return snapshotConnection().openStream("shell:$command")
+        return snapshotConnection().openStream("shell:${rootWrap(command)}")
     }
+    /**
+     * 预热 root 授权 (Magisk 首次会弹窗), 避免 server 启动时授权还没完成。
+     * 返回 true 表示 su 可用。
+     */
+    suspend fun prewarmRoot(): Boolean = runCatching {
+        shell("id -u").trim().lineSequence().last().toIntOrNull() == 0
+    }.getOrDefault(false)
 
     suspend fun ensureConnectionResponsive() {
         val conn = snapshotConnection()
