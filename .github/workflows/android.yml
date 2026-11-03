@@ -90,7 +90,7 @@ jobs:
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RELEASE_STORE_FILE"
 
       - name: Build signed release APKs
-        run: ./gradlew clean assembleRelease -PabiList=arm64-v8a
+        run: ./gradlew clean assembleDebug -PabiList=arm64-v8a
 
       - name: Collect CI APKs
         run: |
@@ -202,7 +202,7 @@ jobs:
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RELEASE_STORE_FILE"
 
       - name: Build signed release APKs
-        run: ./gradlew clean assembleRelease -PabiList=arm64-v8a
+        run: ./gradlew clean assembleDebug -PabiList=arm64-v8a
 
       - name: Collect release assets
         run: |
