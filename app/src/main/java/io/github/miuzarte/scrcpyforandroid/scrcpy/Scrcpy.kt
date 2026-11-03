@@ -452,6 +452,54 @@ class Scrcpy(
         session.scanFile(path)
     }
 
+    // scrcpy-server 由 app_process 启动后会被系统降权到 shell(2000), 无法拿到 INJECT_EVENTS。
+    // 此时改用 root 的 input 命令模拟触摸/按键。
+    @Volatile
+    private var rootInputMode = false
+
+    @Volatile
+    private var deviceW = 0
+
+    @Volatile
+    private var deviceH = 0
+
+    private var gestureStartX = 0
+    private var gestureStartY = 0
+    private var gestureLastX = 0
+    private var gestureLastY = 0
+    private var gestureStartTime = 0L
+    private var gestureActive = false
+
+    private suspend fun rootInput(args: String) {
+        runCatching { NativeAdbService.shellAsRoot("input $args") }
+            .onFailure { Log.w(TAG, "rootInput failed: input $args", it) }
+    }
+
+    private suspend fun deviceSize(): Pair<Int, Int> {
+        if (deviceW != 0 && deviceH != 0) return deviceW to deviceH
+        val out = runCatching { NativeAdbService.shell("wm size") }.getOrNull().orEmpty()
+        val matches = Regex("""(\d+)\s*x\s*(\d+)""").findAll(out).toList()
+        val last = matches.lastOrNull()
+        if (last != null) {
+            deviceW = last.groupValues[1].toInt()
+            deviceH = last.groupValues[2].toInt()
+        } else {
+            deviceW = 1080
+            deviceH = 2400
+        }
+        return deviceW to deviceH
+    }
+
+    /** 把视频分辨率坐标换算成设备分辨率坐标(考虑横竖屏方向) */
+    private suspend fun mapToDevice(x: Int, y: Int, screenWidth: Int, screenHeight: Int): Pair<Int, Int> {
+        val (pw, ph) = deviceSize()
+        if (screenWidth <= 0 || screenHeight <= 0) return x to y
+        val rotated = (screenWidth >= screenHeight) != (pw >= ph)
+        val w = if (rotated) ph else pw
+        val h = if (rotated) pw else ph
+        return (x * w / screenWidth) to (y * h / screenHeight)
+    }
+
     suspend fun injectTouch(
         action: Int,
         pointerId: Long,
@@ -463,17 +511,62 @@ class Scrcpy(
         actionButton: Int = 0,
         buttons: Int = 0,
     ) = withContext(Dispatchers.IO) {
-        session.injectTouch(
-            action = action,
-            pointerId = pointerId,
-            x = x,
-            y = y,
-            screenWidth = screenWidth,
-            screenHeight = screenHeight,
-            pressure = pressure,
-            actionButton = actionButton,
-            buttons = buttons,
-        )
+        if (!rootInputMode) {
+            session.injectTouch(
+                action = action,
+                pointerId = pointerId,
+                x = x,
+                y = y,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                pressure = pressure,
+                actionButton = actionButton,
+                buttons = buttons,
+            )
+            return@withContext
+        }
+        // root 模式: 手势开始/移动只记录, 抬起时合成一条 input tap / input swipe
+        val (dx, dy) = mapToDevice(x, y, screenWidth, screenHeight)
+        when (action) {
+            0 -> { // ACTION_DOWN
+                gestureStartX = dx
+                gestureStartY = dy
+                gestureLastX = dx
+                gestureLastY = dy
+                gestureStartTime = SystemClock.uptimeMillis()
+                gestureActive = true
+            }
+
+            2 -> { // ACTION_MOVE
+                gestureLastX = dx
+                gestureLastY = dy
+            }
+
+            1, 3 -> { // ACTION_UP / ACTION_CANCEL
+                if (!gestureActive) return@withContext
+                gestureActive = false
+                val durationMs = (SystemClock.uptimeMillis() - gestureStartTime).toInt()
+                val movedX = gestureLastX - gestureStartX
+                val movedY = gestureLastY - gestureStartY
+                val moved = kotlin.math.sqrt((movedX * movedX + movedY * movedY).toDouble())
+                if (moved < 30.0) {
+                    if (durationMs > 400) {
+                        // 长按: 原地 swipe 按住不放
+                        rootInput(
+                            "swipe $gestureStartX $gestureStartY " +
+                                "$gestureStartX $gestureStartY ${durationMs.coerceIn(400, 2000)}",
+                        )
+                    } else {
+                        rootInput("tap $gestureStartX $gestureStartY")
+                    }
+                } else {
+                    rootInput(
+                        "swipe $gestureStartX $gestureStartY $gestureLastX $gestureLastY " +
+                            durationMs.coerceIn(50, 1000),
+                    )
+                }
+            }
+        }
     }
 
     suspend fun injectScroll(
@@ -498,7 +591,12 @@ class Scrcpy(
 
     suspend fun pressBackOrTurnScreenOn(action: Int = KeyEvent.ACTION_DOWN) =
         withContext(Dispatchers.IO) {
-            session.pressBackOrTurnScreenOn(action)
+            if (rootInputMode) {
+                // 只在按下时发一次, 避免重复触发
+                if (action == KeyEvent.ACTION_DOWN) rootInput("keyevent KEYCODE_BACK")
+            } else {
+                session.pressBackOrTurnScreenOn(action)
+            }
         }
 
     suspend fun uhidCreate(
@@ -1042,41 +1140,21 @@ class Scrcpy(
         logEvent("请求 root 授权 (首次会弹窗)")
         val suOut = runCatching { NativeAdbService.shellAsRoot("id") }.getOrNull()?.trim()
         logEvent("su -c id 输出: ${suOut ?: "<失败>"}")
-        if (suOut?.contains("uid=0") == true) {
-            logEvent("root 授权成功, server 将以 root 启动")
+        // app_process 启动后会自行降权到 shell(2000), 拿不到 INJECT_EVENTS,
+        // 所以触摸/返回键改由 root 的 input 命令注入
+        val rootOk = suOut?.contains("uid=0") == true
+        rootInputMode = rootOk
+        if (rootOk) {
+            logEvent("root 可用: 触摸/返回键改由 root input 模拟")
         } else {
-            logEvent("root 授权失败, server 将以普通 shell 启动")
+            logEvent("root 不可用: 触摸走 scrcpy 控制通道(可能被拒绝)")
         }
 
-                // Execute server (equivalent to sc_adb_execute in C)
+        // Execute server (equivalent to sc_adb_execute in C)
         Log.i(TAG, "executeServer(): Starting scrcpy server")
         logEvent("scrcpy-server args: $serverCommand")
-
-        // 用设备上的脚本以 root 启动 server: 避免 su + 引号的二次解析,
-        // 并把 server 进程的真实 uid 写进 server_log_tail 便于判断
-        val paramsText = serverCommand.substringAfter(
-            "com.genymobile.scrcpy.Server ${cfg.serverVersion} ", "",
-        )
-        val scriptPath = "/data/local/tmp/scrcpy-root.sh"
-        val scriptFile = File(appContext.cacheDir, "scrcpy-root.sh")
-        scriptFile.writeText(
-            buildString {
-                appendLine("#!/system/bin/sh")
-                appendLine("exec 2>&1")
-                appendLine("echo \"su uid=\$(id -u)\"")
-                appendLine("export CLASSPATH=${cfg.serverRemotePath}")
-                appendLine("app_process / com.genymobile.scrcpy.Server ${cfg.serverVersion} $paramsText &")
-                appendLine("pid=\$!")
-                appendLine("sleep 3")
-                appendLine("grep -E '^(Name|Uid)' /proc/\$pid/status")
-                appendLine("wait \$pid")
-            },
-        )
-        NativeAdbService.push(scriptFile.toPath(), scriptPath)
-        logEvent("root 启动脚本: $scriptPath")
-
         val sessionInfo = session.start(
-            serverCommand = "/system/bin/sh $scriptPath",
+            serverCommand = serverCommand,
             scid = scid,
             options = options,
         )
@@ -1157,11 +1235,7 @@ class Scrcpy(
             val socketName = socketNameFor(scid.toInt())
 
             try {
-                val serverStream = NativeAdbService.openShellStreamAsRoot(serverCommand)
-                runCatching {
-                    logEvent("server 身份: " + NativeAdbService.shellAsRoot(
-                        "ps -A | grep app_process | head -n 2").trim())
-                }
+                val serverStream = NativeAdbService.openShellStream(serverCommand)
                 val serverLogThread = startServerLogThread(serverStream, socketName)
                 Thread.sleep(SERVER_BOOT_DELAY_MS)
 
