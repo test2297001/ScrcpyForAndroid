@@ -1048,11 +1048,35 @@ class Scrcpy(
             logEvent("root 授权失败, server 将以普通 shell 启动")
         }
 
-        // Execute server (equivalent to sc_adb_execute in C)
+                // Execute server (equivalent to sc_adb_execute in C)
         Log.i(TAG, "executeServer(): Starting scrcpy server")
         logEvent("scrcpy-server args: $serverCommand")
+
+        // 用设备上的脚本以 root 启动 server: 避免 su + 引号的二次解析,
+        // 并把 server 进程的真实 uid 写进 server_log_tail 便于判断
+        val paramsText = serverCommand.substringAfter(
+            "com.genymobile.scrcpy.Server ${cfg.serverVersion} ", "",
+        )
+        val scriptPath = "/data/local/tmp/scrcpy-root.sh"
+        val scriptFile = File(appContext.cacheDir, "scrcpy-root.sh")
+        scriptFile.writeText(
+            buildString {
+                appendLine("#!/system/bin/sh")
+                appendLine("exec 2>&1")
+                appendLine("echo \"su uid=\$(id -u)\"")
+                appendLine("export CLASSPATH=${cfg.serverRemotePath}")
+                appendLine("app_process / com.genymobile.scrcpy.Server ${cfg.serverVersion} $paramsText &")
+                appendLine("pid=\$!")
+                appendLine("sleep 3")
+                appendLine("grep -E '^(Name|Uid)' /proc/\$pid/status")
+                appendLine("wait \$pid")
+            },
+        )
+        NativeAdbService.push(scriptFile.toPath(), scriptPath)
+        logEvent("root 启动脚本: $scriptPath")
+
         val sessionInfo = session.start(
-            serverCommand = serverCommand,
+            serverCommand = "/system/bin/sh $scriptPath",
             scid = scid,
             options = options,
         )
