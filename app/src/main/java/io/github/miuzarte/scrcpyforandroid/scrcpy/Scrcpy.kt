@@ -1038,6 +1038,13 @@ class Scrcpy(
             cfg.serverVersion,
         )
         Log.d(TAG, "Server command: $serverCommand")
+        // 预热 root 授权 (Magisk 首次会弹窗), 避免 server 启动时授权还没完成
+        logEvent("请求 root 授权 (首次会弹窗)")
+        if (NativeAdbService.prewarmRoot()) {
+            logEvent("root 授权成功, server 将以 root 启动")
+        } else {
+            logEvent("root 授权失败, 画面可见但无法注入点击")
+        }
 
         // Execute server (equivalent to sc_adb_execute in C)
         Log.i(TAG, "executeServer(): Starting scrcpy server")
@@ -1259,7 +1266,16 @@ class Scrcpy(
                 return sessionInfo
             } catch (t: Throwable) {
                 val tail = snapshotServerLogs()
-                val detail = if (tail.isBlank()) "" else " | server_log_tail=\n$tail"
+                // 诊断: server 只在 shell 里留下一行日志时, 用它判断 socket 是否真的被创建、root 进程是否还活着
+                val dump = runCatching {
+                    NativeAdbService.shell(
+                        "cat /proc/net/unix | grep -F scrcpy_; ps -A | grep app_process",
+                    ).trim()
+                }.getOrNull()
+                val detail = buildString {
+                    if (tail.isNotBlank()) append(" | server_log_tail=\n").append(tail)
+                    if (!dump.isNullOrBlank()) append(" | device_dump=\n").append(dump)
+                }
                 throw IllegalStateException("scrcpy start failed: ${t.message}$detail", t)
             }
         }
